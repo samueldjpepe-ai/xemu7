@@ -4,23 +4,24 @@
 #include <setupapi.h>
 #include <tlhelp32.h>
 #include <iostream>
-#include <vector>
-#include <fstream>
-#include <map>
 #include <string>
-#include <conio.h>
+#include <vector>
 #include <algorithm>
 #include <sstream>
+#include <fstream>
+#include <map>
+#include <conio.h>
 #include <SDL.h>
 #include "ViGEm/Client.h"
 
 #pragma comment(lib, "setupapi.lib")
 #pragma comment(lib, "advapi32.lib")
 
-// --- ESTRUCTURAS DEL EMULADOR ---
+// --- ESTRUCTURAS UNIFICADAS ---
+
 struct Mapeo {
-    int botones[10]; 
-    int dpad_tipo;   
+    int botones[10]; // A, B, X, Y, LB, RB, START, BACK, L3, R3
+    int dpad_tipo;   // 0: Botones, 1: Hat
     int dpad_ids[4]; 
     int ejes[4];     
     int signos[4];   
@@ -36,97 +37,115 @@ struct ControllerPair {
     std::string guid;
 };
 
-// Estructura para emparejar lo que ve SDL2 con lo que necesita HidGuardian
-struct MandoFiltrado {
-    int indexSDL;
-    std::string nameSDL;
-    std::string guidSDL;
+struct MandoInfo {
+    std::wstring name;
     std::wstring hwID;
 };
 
+// --- VARIABLES GLOBALES ---
+std::vector<std::wstring> g_bloqueados;
 std::map<std::string, Mapeo> baseDeDatos;
 std::vector<std::string> nombresBotones = {"A", "B", "X", "Y", "LB", "RB", "START", "BACK", "L3 (Stick Izq)", "R3 (Stick Der)"};
-std::vector<std::wstring> g_bloqueados;
 
-// --- CONTROL DE PRIVILEGIOS ---
-bool EsAdministrador() {
-    BOOL fRet = FALSE;
-    HANDLE hToken = NULL;
-    if (OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &hToken)) {
-        TOKEN_ELEVATION elevation;
-        DWORD cbSize = sizeof(TOKEN_ELEVATION);
-        if (GetTokenInformation(hToken, TokenElevation, &elevation, sizeof(elevation), &cbSize)) {
-            fRet = elevation.TokenIsElevated;
-        }
-    }
-    if (hToken) CloseHandle(hToken);
-    return fRet;
+const std::string CONFIG_MANDOS_REG = "config_mando.txt";      // Archivo de HidGuardian (IDs bloqueadas)
+const std::string CONFIG_MAPEOS_DAT = "controles_config.dat"; // Archivo de calibración (Mapeos)
+
+PVIGEM_CLIENT client = nullptr;
+
+// --- FUNCIONES AUXILIARES DE SISTEMA Y NOMBRE ---
+
+std::wstring ObtenerNombrePropioExe() {
+    wchar_t buffer[MAX_PATH];
+    GetModuleFileNameW(NULL, buffer, MAX_PATH);
+    std::wstring ruta(buffer);
+    size_t pos = ruta.find_last_of(L"\\/");
+    return (pos == std::wstring::npos) ? ruta : ruta.substr(pos + 1);
 }
 
-// --- FUNCIÓN INTELIGENTE DE RASTREO DE HWID ---
-std::wstring BuscarHardwareIDPorNombre(const std::string& nombreBuscado) {
-    HDEVINFO hDevInfo = SetupDiGetClassDevsW(&GUID_DEVCLASS_HIDCLASS, NULL, NULL, DIGCF_PRESENT);
-    if (hDevInfo == INVALID_HANDLE_VALUE) return L"";
+// --- PERSISTENCIA Y CARGA DE ARCHIVOS ---
 
-    // Convertir el nombre de SDL a minusculas para comparar mejor
-    std::string nombreSDL = nombreBuscado;
-    std::transform(nombreSDL.begin(), nombreSDL.end(), nombreSDL.begin(), ::tolower);
-
-    SP_DEVINFO_DATA devData = { sizeof(SP_DEVINFO_DATA) };
-    for (DWORD i = 0; SetupDiEnumDeviceInfo(hDevInfo, i, &devData); i++) {
-        wchar_t buf[1024];
-        std::string nombreWindows = "";
-
-        if (SetupDiGetDeviceRegistryPropertyW(hDevInfo, &devData, SPDRP_FRIENDLYNAME, NULL, (PBYTE)buf, sizeof(buf), NULL) ||
-            SetupDiGetDeviceRegistryPropertyW(hDevInfo, &devData, SPDRP_DEVICEDESC, NULL, (PBYTE)buf, sizeof(buf), NULL)) {
-            
-            // Convertir wchar_t de Windows a std::string para comparar
-            std::wstring ws(buf);
-            nombreWindows = std::string(ws.begin(), ws.end());
-            std::transform(nombreWindows.begin(), nombreWindows.end(), nombreWindows.begin(), ::tolower);
-        }
-
-        // Si el nombre del Administrador de Dispositivos coincide o contiene el nombre que nos dio SDL
-        if (!nombreWindows.empty() && (nombreWindows.find(nombreSDL) != std::string::npos || nombreSDL.find(nombreWindows) != std::string::npos)) {
-            if (SetupDiGetDeviceRegistryPropertyW(hDevInfo, &devData, SPDRP_HARDWAREID, NULL, (PBYTE)buf, sizeof(buf), NULL)) {
-                std::wstring hwID = buf;
-                if (hwID.find(L"VID_") != std::wstring::npos) {
-                    SetupDiDestroyDeviceInfoList(hDevInfo);
-                    return hwID; // Encontrado
-                }
-            }
-        }
+void cargarMapeosSDL() {
+    std::ifstream archivo(CONFIG_MAPEOS_DAT, std::ios::binary);
+    if (!archivo) return;
+    std::string guid;
+    while (archivo >> guid) {
+        archivo.ignore();
+        Mapeo m;
+        archivo.read((char*)&m, sizeof(Mapeo));
+        baseDeDatos[guid] = m;
     }
-    SetupDiDestroyDeviceInfoList(hDevInfo);
-    return L""; 
+    archivo.close();
 }
 
-// --- FUNCIONES HIDGUARDIAN ---
-bool AplicarCambiosHidGuardian(bool bloquear) {
+void guardarMapeosSDL() {
+    std::ofstream archivo(CONFIG_MAPEOS_DAT, std::ios::binary);
+    for (auto const& [guid, mapeo] : baseDeDatos) {
+        archivo << guid << " ";
+        archivo.write((char*)&mapeo, sizeof(Mapeo));
+    }
+    archivo.close();
+}
+
+void guardarConfigHidGuardian() {
+    std::wofstream archivo(CONFIG_MANDOS_REG);
+    if (archivo.is_open()) {
+        archivo << ObtenerNombrePropioExe() << L"\n";
+        for (const auto& id : g_bloqueados) {
+            archivo << id << L"\n";
+        }
+        archivo.close();
+    }
+}
+
+bool cargarConfigHidGuardian() {
+    std::wifstream archivo(CONFIG_MANDOS_REG);
+    if (!archivo.is_open()) return false;
+
+    g_bloqueados.clear();
+    std::wstring exeGuardado;
+    if (std::getline(archivo, exeGuardado)) {
+        // Ignoramos verificación de PID externo, nos auto-agregamos dinámicamente
+    }
+
+    std::wstring lineaId;
+    while (std::getline(archivo, lineaId)) {
+        if (!lineaId.empty()) {
+            g_bloqueados.push_back(lineaId);
+        }
+    }
+    archivo.close();
+    return true;
+}
+
+// --- LÓGICA HIDGUARDIAN (FILTRADO Y REPOSITORIO DE REGISTRO) ---
+
+bool AplicarCambiosRegistro() {
     HKEY hKey;
     LPCWSTR path = L"SYSTEM\\CurrentControlSet\\Services\\HidGuardian\\Parameters";
     if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, path, 0, KEY_ALL_ACCESS, &hKey) != ERROR_SUCCESS) return false;
 
+    // Escribir la lista de dispositivos afectados (bloqueados)
     std::vector<wchar_t> multiSz;
-    if (bloquear) {
-        for (const auto& id : g_bloqueados) {
-            for (wchar_t c : id) multiSz.push_back(c);
-            multiSz.push_back(L'\0');
-        }
+    for (const auto& id : g_bloqueados) {
+        for (wchar_t c : id) multiSz.push_back(c);
+        multiSz.push_back(L'\0');
     }
     multiSz.push_back(L'\0'); 
     RegSetValueExW(hKey, L"AffectedDevices", 0, REG_MULTI_SZ, (BYTE*)multiSz.data(), (DWORD)(multiSz.size() * sizeof(wchar_t)));
 
-    std::wstring p = L"Whitelist\\" + std::to_wstring(GetCurrentProcessId());
+    // AUTO-WHITELIST RADICAL: Agregamos nuestro propio PID en caliente
+    DWORD miPID = GetCurrentProcessId();
+    std::wstring p = L"Whitelist\\" + std::to_wstring(miPID);
     HKEY hSubKey;
     if (RegCreateKeyExW(hKey, p.c_str(), 0, NULL, 0, KEY_WRITE, NULL, &hSubKey, NULL) == ERROR_SUCCESS) {
         RegCloseKey(hSubKey);
     }
+
     RegCloseKey(hKey);
     return true;
 }
 
-void ReiniciarSistemaHID() {
+void ReiniciarSubSistemaHID() {
     HDEVINFO hDevInfo = SetupDiGetClassDevsW(&GUID_DEVCLASS_HIDCLASS, NULL, NULL, DIGCF_PRESENT);
     if (hDevInfo == INVALID_HANDLE_VALUE) return;
 
@@ -140,28 +159,73 @@ void ReiniciarSistemaHID() {
     SetupDiDestroyDeviceInfoList(hDevInfo);
 }
 
-// --- FUNCIONES DEL EMULADOR ---
-void cargarConfig() {
-    std::ifstream archivo("controles_config.dat", std::ios::binary);
-    if (!archivo) return;
-    std::string guid;
-    while (archivo >> guid) {
-        archivo.ignore();
-        Mapeo m;
-        archivo.read((char*)&m, sizeof(Mapeo));
-        baseDeDatos[guid] = m;
+// --- FILTRADO DE MANDOS MEDIANTE SDL2 ---
+
+struct SDL_GamepadID {
+    Uint16 vid;
+    Uint16 pid;
+};
+
+std::vector<SDL_GamepadID> ObtenerControlesActivosPorSDL() {
+    std::vector<SDL_GamepadID> listaControles;
+    int numJoysticks = SDL_NumJoysticks();
+    for (int i = 0; i < numJoysticks; i++) {
+        Uint16 vid = SDL_JoystickGetDeviceVendor(i);
+        Uint16 pid = SDL_JoystickGetDeviceProduct(i);
+        if (vid != 0 || pid != 0) {
+            listaControles.push_back({ vid, pid });
+        }
     }
-    archivo.close();
+    return listaControles;
 }
 
-void guardarConfig() {
-    std::ofstream archivo("controles_config.dat", std::ios::binary);
-    for (auto const& [guid, mapeo] : baseDeDatos) {
-        archivo << guid << " ";
-        archivo.write((char*)&mapeo, sizeof(Mapeo));
+bool ValidarMandoConSDL2(const std::wstring& hwID, const std::vector<SDL_GamepadID>& controlesSDL) {
+    std::wstring idUpper = hwID;
+    std::transform(idUpper.begin(), idUpper.end(), idUpper.begin(), ::towupper);
+
+    for (const auto& ctrl : controlesSDL) {
+        wchar_t vidStr[32];
+        wchar_t pidStr[32];
+        swprintf_s(vidStr, L"VID_%04X", ctrl.vid);
+        swprintf_s(pidStr, L"PID_%04X", ctrl.pid);
+
+        if (idUpper.find(vidStr) != std::wstring::npos && idUpper.find(pidStr) != std::wstring::npos) {
+            return true;
+        }
     }
-    archivo.close();
+    return false;
 }
+
+std::vector<MandoInfo> ListarMandosFiltrados() {
+    std::vector<MandoInfo> lista;
+    HDEVINFO hDevInfo = SetupDiGetClassDevsW(&GUID_DEVCLASS_HIDCLASS, NULL, NULL, DIGCF_PRESENT);
+    if (hDevInfo == INVALID_HANDLE_VALUE) return lista;
+
+    auto controlesSDL = ObtenerControlesActivosPorSDL();
+    SP_DEVINFO_DATA devData = { sizeof(SP_DEVINFO_DATA) };
+
+    for (DWORD i = 0; SetupDiEnumDeviceInfo(hDevInfo, i, &devData); i++) {
+        wchar_t buf[1024];
+        MandoInfo m;
+        if (SetupDiGetDeviceRegistryPropertyW(hDevInfo, &devData, SPDRP_FRIENDLYNAME, NULL, (PBYTE)buf, sizeof(buf), NULL) ||
+            SetupDiGetDeviceRegistryPropertyW(hDevInfo, &devData, SPDRP_DEVICEDESC, NULL, (PBYTE)buf, sizeof(buf), NULL)) {
+            m.name = buf;
+        } else {
+            m.name = L"Dispositivo desconocido";
+        }
+        
+        if (SetupDiGetDeviceRegistryPropertyW(hDevInfo, &devData, SPDRP_HARDWAREID, NULL, (PBYTE)buf, sizeof(buf), NULL)) {
+            m.hwID = buf; 
+            if (ValidarMandoConSDL2(m.hwID, controlesSDL)) {
+                lista.push_back(m);
+            }
+        }
+    }
+    SetupDiDestroyDeviceInfoList(hDevInfo);
+    return lista;
+}
+
+// --- LÓGICA DE CALIBRACIÓN Y EMULACIÓN ---
 
 short aplicarEjeFinal(int valorActual, int signoCalibrado, int deadzone, bool esEjeY, bool invX, bool invY) {
     int dz = deadzone * 100;
@@ -256,144 +320,154 @@ void calibrarMando(SDL_Joystick* joy, std::string guid) {
     }
 
     baseDeDatos[guid] = nuevo;
-    guardarConfig();
-    std::cout << "\n¡Configuracion guardada!\n";
-    Sleep(1000);
+    guardarMapeosSDL();
 }
 
-// --- MAIN ---
-int main(int argc, char* argv[]) {
-    if (!EsAdministrador()) {
-        wchar_t szPath[MAX_PATH];
-        if (GetModuleFileNameW(NULL, szPath, MAX_PATH)) {
-            SHELLEXECUTEINFOW sei = { sizeof(sei) };
-            sei.lpVerb = L"runas"; 
-            sei.lpFile = szPath;
-            sei.hwnd = NULL;
-            sei.nShow = SW_NORMAL;
-            if (ShellExecuteExW(&sei)) return 0;
+// --- SUB-MENÚ DE GESTIÓN DE HIDGUARDIAN (PASO ADICIONAL OPCIONAL) ---
+
+void MenuDispositivosHid() {
+    std::wstring input;
+    while (true) {
+        system("cls");
+        std::wcout << L"=== PASO 2: GESTION DE BLOQUEO DE DISPOSITIVOS ===\n";
+        std::wcout << L"Este programa ya se encuentra en la Whitelist automáticamente.\n\n";
+        
+        auto mandos = ListarMandosFiltrados();
+        std::wcout << L"ID | ESTADO   | CONTROL REAL DETECTADO (SDL2)\n";
+        std::wcout << L"---|----------|------------------------------------\n";
+        for (size_t i = 0; i < mandos.size(); i++) {
+            bool b = std::find(g_bloqueados.begin(), g_bloqueados.end(), mandos[i].hwID) != g_bloqueados.end();
+            std::wcout << i + 1 << L". [" << (b ? L"BLOQUEADO" : L" LIBRE   ") << L"] " << mandos[i].name << L"\n";
+            std::wcout << L"   ID: " << mandos[i].hwID << L"\n\n";
         }
-        std::cout << "ERROR: Requiere privilegios de Administrador.\n";
-        Sleep(3000);
-        return 1;
+
+        if(mandos.empty()) std::wcout << L" No se detectan controles por hardware vinculados a SDL2.\n\n";
+
+        std::wcout << L"OPCIONES:\n";
+        std::wcout << L"- Ingrese numeros separados por coma (ej: 1,2) para alternar el bloqueo.\n";
+        std::wcout << L"- [0] Finalizar gestión de bloqueos y Continuar.\n";
+        std::wcout << L"Seleccion: ";
+        std::wcin >> input;
+
+        if (input == L"0") break;
+
+        std::wstringstream ss(input);
+        std::wstring item;
+        while (std::getline(ss, item, L',')) {
+            try {
+                int idx = std::stoi(item);
+                if (idx > 0 && idx <= (int)mandos.size()) {
+                    auto it = std::find(g_bloqueados.begin(), g_bloqueados.end(), mandos[idx - 1].hwID);
+                    if (it != g_bloqueados.end()) g_bloqueados.erase(it);
+                    else g_bloqueados.push_back(mandos[idx - 1].hwID);
+                }
+            } catch (...) {}
+        }
+
+        if (!AplicarCambiosRegistro()) {
+            std::wcout << L"\n[!] ERROR: No se pudo escribir el registro. Revisa privilegios Admin.\n";
+            Sleep(2000);
+        } else {
+            guardarConfigHidGuardian();
+        }
+        ReiniciarSubSistemaHID();
+        Sleep(600);
+    }
+}
+
+// --- ENTRADA PRINCIPAL ---
+
+int main(int argc, char* argv[]) {
+    _wsetlocale(LC_ALL, L"");
+    
+    // Inicializar subsistemas de video, eventos y joysticks de SDL2
+    SDL_Init(SDL_INIT_JOYSTICK | SDL_INIT_VIDEO | SDL_INIT_EVENTS);
+    
+    // Inicializar cliente virtual de ViGEm Bus
+    client = vigem_alloc();
+    if (vigem_connect(client) != VIGEM_ERROR_NONE) {
+        std::cout << "[!] ERROR: No se pudo conectar al Driver de ViGEm Bus. ¿Esta instalado?\n";
+        SDL_Quit();
+        return -1;
     }
 
-    SDL_Init(SDL_INIT_JOYSTICK | SDL_INIT_VIDEO);
-    cargarConfig();
+    // Cargar ambas configuraciones persistentes
+    cargarMapeosSDL();
+    bool configPreviaHid = cargarConfigHidGuardian();
 
-    // ==========================================
-    // PASO 1: DETECCIÓN INTELIGENTE FILTRADA POR SDL2
-    // ==========================================
-    std::cout << "=== PASO 1: DETECCION DE MANDOS REALES ===\n\n";
-    SDL_JoystickUpdate();
-    int numJoysticks = SDL_NumJoysticks();
-    std::vector<MandoFiltrado> mandosValidos;
+    bool saltarMenuHid = false;
 
-    if (numJoysticks == 0) {
-        std::cout << "No se detectaron mandos de juego conectados mediante SDL2.\n";
-    } else {
-        for (int i = 0; i < numJoysticks; i++) {
-            SDL_Joystick* j = SDL_JoystickOpen(i);
-            if (j) {
-                std::string nombreMando = SDL_JoystickName(j);
-                char guidStr[33];
-                SDL_JoystickGetGUIDString(SDL_JoystickGetGUID(j), guidStr, 33);
-
-                // El programa busca de forma invisible el Hardware ID en Windows usando el nombre
-                std::wstring hwIDEncontrado = BuscarHardwareIDPorNombre(nombreMando);
-
-                MandoFiltrado mf = { i, nombreMando, std::string(guidStr), hwIDEncontrado };
-                mandosValidos.push_back(mf);
-
-                std::cout << "[" << mandosValidos.size() << "] Mando: " << mf.nameSDL << "\n";
-                if (!mf.hwID.empty()) {
-                    std::wcout << L"    Hardware ID (Auto-Detectado): " << mf.hwID << L"\n";
-                    g_bloqueados.push_back(mf.hwID); // Se agrega a la lista de bloqueo
-                } else {
-                    std::cout << "    Hardware ID: [No se pudo recuperar el ID de registro]\n";
-                }
-                std::cout << "\n";
-                SDL_JoystickClose(j);
+    // Menú de arranque inicial
+    if (configPreviaHid) {
+        std::wcout << L"=== SE DETECTÓ CONFIGURACIÓN PREVIA DE HARDWARE ===\n";
+        std::wcout << L"[0] Cargar bloqueos automáticos y avanzar a emulación\n";
+        std::wcout << L"[1] Reconfigurar bloqueos de hardware (HidGuardian)\n";
+        std::wcout << L"Selección: ";
+        int opc;
+        if (std::wcin >> opc && opc == 0) {
+            if (AplicarCambiosRegistro()) {
+                ReiniciarSubSistemaHID();
+                saltarMenuHid = true;
+                std::wcout << L"[OK] Bloqueos aplicados. Auto-Whitelist inyectada.\n";
+                Sleep(1000);
             }
         }
     }
 
-    // ==========================================
-    // PASO 2: OCULTAMIENTO (HidGuardian)
-    // ==========================================
-    std::cout << "=== PASO 2: OCULTAMIENTO (HidGuardian) ===\n";
-    std::cout << "[\242Quieres bloquear/ocultar los mandos f\244sicos listados arriba?]\n";
-    std::cout << "[1] SI, bloquear originales.\n";
-    std::cout << "[0] NO, mantenerlos libres.\n";
-    std::cout << "Selecci\242n (0/1): ";
-    int opcBloqueo = 0;
-    std::cin >> opcBloqueo;
-
-    if (opcBloqueo == 1 && !g_bloqueados.empty()) {
-        if (AplicarCambiosHidGuardian(true)) {
-            ReiniciarSistemaHID();
-            std::cout << "[OK] Mandos ocultados con éxito.\n\n";
-        } else {
-            std::cout << "[!] ERROR: Fall\242 al escribir en HidGuardian.\n\n";
-        }
-    } else {
-        AplicarCambiosHidGuardian(false); 
-        ReiniciarSistemaHID();
-        std::cout << "[INFO] Mandos libres y visibles.\n\n";
+    if (!saltarMenuHid) {
+        MenuDispositivosHid();
     }
-    Sleep(1000);
 
-    // ==========================================
-    // PASO 3: MENÚ DE EMULACIÓN Y CONFIGURACIÓN
-    // ==========================================
-    PVIGEM_CLIENT client = vigem_alloc();
-    vigem_connect(client);
-
+    // Bucle Principal del Emulador XInput
     while (true) {
         SDL_JoystickUpdate();
         system("cls");
-        std::cout << "=== PASO 3: CONTROL DE EMULACION V3 (FILTRADO) ===\n\n";
+        int n = SDL_NumJoysticks();
+        std::cout << "=== EMULADOR XINPUT MASTER V3 (HIDGUARDIAN ACTIVO) ===\n";
         
-        // Volvemos a listar solo los mandos detectados por el filtro
-        for (size_t i = 0; i < mandosValidos.size(); i++) {
-            std::cout << "Mando [" << i + 1 << "]: " << mandosValidos[i].nameSDL 
-                      << (baseDeDatos.count(mandosValidos[i].guidSDL) ? " [LISTO]" : " [!] CONFIGURAR REQUERIDA") << std::endl;
+        std::vector<std::string> gList;
+        for (int i = 0; i < n && i < 6; i++) {
+            SDL_Joystick* j = SDL_JoystickOpen(i);
+            char gs[33]; 
+            SDL_JoystickGetGUIDString(SDL_JoystickGetGUID(j), gs, 33);
+            gList.push_back(gs);
+            std::cout << "[" << i + 1 << "] " << SDL_JoystickName(j) 
+                      << (baseDeDatos.count(gs) ? " [MAPEO LISTO]" : " [!] REQUIERE CONFIGURAR") << std::endl;
         }
 
-        std::cout << "\nOPCIONES DISPONIBLES:\n";
-        std::cout << "[1] INICIAR EMULACION DE MANDOS VIRTUALES (Jugar)\n";
-        std::cout << "[0] IR A CONFIGURAR / CALIBRAR MANDOS\n";
-        std::cout << "[ESC] Salir del programa\n\n";
-        std::cout << "Selecci\242n: ";
+        std::cout << "\n[0] INICIAR EMULACIÓN (JUGAR)\n";
+        std::cout << "[G] Volver a Gestionar Bloqueos (HidGuardian)\n";
+        std::cout << "[ESC] Salir del Software\n";
+        std::cout << "Selección: ";
         
-        std::string inputMenu;
-        std::cin >> inputMenu;
+        std::string seleccion;
+        std::cin >> seleccion;
 
-        if (inputMenu == "1") {
+        if (seleccion == "0") {
             std::vector<ControllerPair> emus;
-            for (size_t i = 0; i < mandosValidos.size(); i++) {
-                if (baseDeDatos.count(mandosValidos[i].guidSDL)) {
-                    emus.push_back({SDL_JoystickOpen(mandosValidos[i].indexSDL), vigem_target_x360_alloc(), mandosValidos[i].guidSDL});
+            for (int i = 0; i < n && i < 6; i++) {
+                if (baseDeDatos.count(gList[i])) {
+                    emus.push_back({SDL_JoystickOpen(i), vigem_target_x360_alloc(), gList[i]});
                     vigem_target_add(client, emus.back().virtualPad);
                 }
             }
-
-            if(emus.empty()) {
-                std::cout << "\n[!] Configura tus mandos primero con la opci\242n [0].\n";
-                Sleep(2500);
-                continue;
-            }
-
-            std::cout << "\n>>> EMULANDO MANDOS XBOX 360 ACTIVOS <<<\n";
-            std::cout << "Presiona la tecla 'M' para detener la emulaci\242n y volver.\n";
+            
+            std::cout << "\n>>> EMULANDO MANDOS XBOX 360 EN SEGUNDO PLANO <<<\n";
+            std::cout << "Presiona 'M' en el teclado para volver al menú.\n";
             
             while (true) {
                 if (_kbhit() && tolower(_getch()) == 'm') break;
+                
                 SDL_JoystickUpdate();
+                // Asegurar refresco dinámico de la Whitelist del software activo
+                AplicarCambiosRegistro(); 
+
                 for (auto& e : emus) {
-                    XUSB_REPORT r; XUSB_REPORT_INIT(&r);
+                    XUSB_REPORT r; 
+                    XUSB_REPORT_INIT(&r);
                     Mapeo m = baseDeDatos[e.guid];
 
+                    // Botones Físicos -> Virtuales
                     if(SDL_JoystickGetButton(e.physical, m.botones[0])) r.wButtons |= XUSB_GAMEPAD_A;
                     if(SDL_JoystickGetButton(e.physical, m.botones[1])) r.wButtons |= XUSB_GAMEPAD_B;
                     if(SDL_JoystickGetButton(e.physical, m.botones[2])) r.wButtons |= XUSB_GAMEPAD_X;
@@ -405,6 +479,7 @@ int main(int argc, char* argv[]) {
                     if(SDL_JoystickGetButton(e.physical, m.botones[8])) r.wButtons |= XUSB_GAMEPAD_LEFT_THUMB; 
                     if(SDL_JoystickGetButton(e.physical, m.botones[9])) r.wButtons |= XUSB_GAMEPAD_RIGHT_THUMB; 
 
+                    // Cruceta / DPAD
                     if (m.dpad_tipo == 0) {
                         if(SDL_JoystickGetButton(e.physical, m.dpad_ids[0])) r.wButtons |= XUSB_GAMEPAD_DPAD_UP;
                         if(SDL_JoystickGetButton(e.physical, m.dpad_ids[1])) r.wButtons |= XUSB_GAMEPAD_DPAD_DOWN;
@@ -418,11 +493,13 @@ int main(int argc, char* argv[]) {
                         if(h & SDL_HAT_RIGHT) r.wButtons |= XUSB_GAMEPAD_DPAD_RIGHT;
                     }
 
+                    // Sticks Analógicos de Entrada con Ajustes Modificados
                     r.sThumbLY = aplicarEjeFinal(SDL_JoystickGetAxis(e.physical, m.ejes[0]), m.signos[0], m.deadzoneIZQ, true, m.invertirX, m.invertirY);
                     r.sThumbLX = aplicarEjeFinal(SDL_JoystickGetAxis(e.physical, m.ejes[1]), m.signos[1], m.deadzoneIZQ, false, m.invertirX, m.invertirY);
                     r.sThumbRY = aplicarEjeFinal(SDL_JoystickGetAxis(e.physical, m.ejes[2]), m.signos[2], m.deadzoneDER, true, m.invertirX, m.invertirY);
-                    r.sThumbRX = aplicarEjeFinal(SDL_JoystickGetAxis(e.physical, m.ejes[3]), m.signos[3], false, m.deadzoneDER, m.invertirX, m.invertirY);
+                    r.sThumbRX = aplicarEjeFinal(SDL_JoystickGetAxis(e.physical, m.ejes[3]), m.signos[3], m.deadzoneDER, false, m.invertirX, m.invertirY);
 
+                    // Triggers Genéricos asignados de forma estática
                     if (SDL_JoystickGetButton(e.physical, 6)) r.bLeftTrigger = 255;
                     if (SDL_JoystickGetButton(e.physical, 7)) r.bRightTrigger = 255;
 
@@ -431,23 +508,36 @@ int main(int argc, char* argv[]) {
                 Sleep(8);
             }
 
-            for(auto& e : emus){ vigem_target_remove(client, e.virtualPad); vigem_target_free(e.virtualPad); }
-
-        } else if (inputMenu == "0") {
-            std::cout << "\nIngrese el n\243mero de mando a calibrar (1-" << mandosValidos.size() << "): ";
-            int indexMando;
-            std::cin >> indexMando;
-            if (indexMando > 0 && indexMando <= (int)mandosValidos.size()) {
-                calibrarMando(SDL_JoystickOpen(mandosValidos[indexMando - 1].indexSDL), mandosValidos[indexMando - 1].guidSDL);
+            // Desvincular mandos al regresar al menú principal
+            for(auto& e : emus){ 
+                vigem_target_remove(client, e.virtualPad); 
+                vigem_target_free(e.virtualPad); 
             }
-        } else {
-            break; 
+        } 
+        else if (seleccion == "G" || seleccion == "g") {
+            MenuDispositivosHid();
+        } 
+        else if (seleccion == "ESC" || seleccion == "esc") {
+            break;
+        } 
+        else {
+            try {
+                int op = std::stoi(seleccion);
+                if (op > 0 && op <= n) {
+                    SDL_Joystick* jSel = SDL_JoystickOpen(op - 1);
+                    char gs[33]; 
+                    SDL_JoystickGetGUIDString(SDL_JoystickGetGUID(jSel), gs, 33);
+                    calibrarMando(jSel, gs);
+                }
+            } catch(...) {}
         }
     }
 
-    AplicarCambiosHidGuardian(false); 
-    ReiniciarSistemaHID();
-    vigem_disconnect(client);
-    vigem_free(client);
+    // Desconexión limpia del entorno de simulación
+    if (client) {
+        vigem_disconnect(client);
+        vigem_free(client);
+    }
+    SDL_Quit();
     return 0;
 }
